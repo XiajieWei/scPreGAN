@@ -34,17 +34,19 @@ you can use follow codes for this purpose.
 ```python
 from scPreGAN import *
 
-# create model
-model = Model(n_features=n_features, use_cuda=True)
-
-# training
-train_data = load_anndata(data_path=data_path,
+# load data
+train_data = load_anndata(path=data_path,
                 condition_key=condition_key,
                 condition=condition,
                 cell_type_key=cell_type_key,
                 out_of_sample_prediction=out_of_sample_prediction,
                 prediction_cell_type=cell_type
                 )
+
+# create model
+model = Model(n_features=n_features, n_classes=n_classes, use_cuda=True)
+
+# training
 model.train(train_data=train_data)
 
 # predicting
