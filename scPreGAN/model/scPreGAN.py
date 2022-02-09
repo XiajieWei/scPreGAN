@@ -381,6 +381,9 @@ class Model:
                             out_ABA, out_ABA_cls = self.D_A(ABA, cell_type_A_val)
                             out_BAB, out_BAB_cls = self.D_B(BAB, cell_type_B_val)
 
+                            _cell_type_A = torch.argmax(cell_type_A_val, dim=-1)
+                            _cell_type_B = torch.argmax(cell_type_B_val, dim=-1)
+                            
                             D_A_real_loss_val = dis_criterion(outA_val, ones) + aux_criterion(out_A_cls, _cell_type_A)
                             D_B_real_loss_val = dis_criterion(outB_val, ones) + aux_criterion(out_B_cls, _cell_type_B)
                             D_A_fake_loss_val = dis_criterion(out_BA, zeros) + aux_criterion(out_BA_cls, _cell_type_B) 
