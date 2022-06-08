@@ -14,35 +14,17 @@ from scipy import sparse
 import pandas as pd
 import random
 
-from scPreGAN.model.Discriminator import Discriminator
-from scPreGAN.model.Generator import Generator
-from scPreGAN.model.Encoder import Encoder
+from scPreGAN.model.Discriminator import Discriminator_AC
+from scPreGAN.model.Generator import Generator_AC_layer
+from scPreGAN.model.Encoder import Encoder_AC_layer
 
-
-def calc_gradient_penalty(disc, real_data, fake_data, batch_size, use_cuda, k, p):
-    alpha = torch.rand(batch_size, 1)
-    alpha = alpha.expand(real_data.size())
-    alpha = alpha.cuda() if use_cuda else alpha
-
-    interpolates = alpha * real_data + ((1 - alpha) * fake_data)
-
-    if use_cuda and cuda_is_available():
-        interpolates = interpolates.cuda()
-    interpolates = Variable(interpolates, requires_grad=True)
-
-    disc_interpolates = disc(interpolates)
-
-    gradients = autograd.grad(outputs=disc_interpolates,
-                              inputs=interpolates,
-                              grad_outputs=torch.ones(disc_interpolates.size()).cuda() if use_cuda else torch.ones(
-                                  disc_interpolates.size()),
-                              create_graph=True, retain_graph=True, only_inputs=True)[0]
-
-    gradient_penalty = torch.pow(gradients.norm(2, dim=1), p).mean() * k
-    return gradient_penalty
+def init_weights(m):
+    if type(m) == torch.nn.Linear:
+        torch.nn.init.xavier_uniform(m.weight, 1e-2)
+        m.bias.data.fill_(0.01)
 
 class Model:
-    def __init__(self, n_features, z_dim=16, min_hidden_size=256, use_cuda=True, manual_seed=3060):
+    def __init__(self, n_features, n_classes, z_dim=16, min_hidden_size=256, use_cuda=True, manual_seed=3060):
         if manual_seed is None:
             manual_seed = random.randint(1, 10000)
         print("Random Seed: ", manual_seed)
@@ -56,13 +38,13 @@ class Model:
                 torch.nn.init.xavier_uniform(m.weight, 1e-2)
                 m.bias.data.fill_(0.01)
 
-        D_A = Discriminator(n_features=n_features, min_hidden_size=min_hidden_size, out_dim=1)
-        D_B = Discriminator(n_features=n_features, min_hidden_size=min_hidden_size, out_dim=1)
+        D_A = Discriminator_AC(n_features=n_features, min_hidden_size=min_hidden_size, out_dim=1, n_classes=n_classes)
+        D_B = Discriminator_AC(n_features=n_features, min_hidden_size=min_hidden_size, out_dim=1, n_classes=n_classes)
 
-        G_A = Generator(z_dim=z_dim, min_hidden_size=min_hidden_size, n_features=n_features)
-        G_B = Generator(z_dim=z_dim, min_hidden_size=min_hidden_size, n_features=n_features)
-        E = Encoder(n_features=n_features, min_hidden_size=min_hidden_size, z_dim=z_dim)
-
+        G_A = Generator_AC_layer(z_dim=z_dim, min_hidden_size=min_hidden_size, n_features=n_features)
+        G_B = Generator_AC_layer(z_dim=z_dim, min_hidden_size=min_hidden_size, n_features=n_features)
+        E = Encoder_AC_layer(n_features=n_features, min_hidden_size=min_hidden_size, z_dim=z_dim)
+ 
         init_weights(E)
         init_weights(G_A)
         init_weights(G_B)
@@ -84,29 +66,7 @@ class Model:
         self.use_cuda = use_cuda
         print("Successfully created the model")
 
-    def load_anndata(self, data_path, condition_key, condition, cell_type_key,
-                     out_of_sample_prediction=False, prediction_cell_type=None):
-        adata = sc.read(data_path)
-        if out_of_sample_prediction and prediction_cell_type is not None:
-            case_adata = adata[
-                ~(adata.obs[cell_type_key] == prediction_cell_type) & (adata.obs[condition_key] == condition['case'])]
-        elif out_of_sample_prediction == False:
-            case_adata = adata[adata.obs[condition_key] == condition['case']]
-        else:
-            raise Exception("Must provide prediction_cell_type if out_of_sample_prediction is True.")
 
-        control_adata = adata[adata.obs[condition_key] == condition['control']]
-
-        if sparse.issparse(adata.X):
-            control_pd = pd.DataFrame(data=control_adata.X.A, index=control_adata.obs_names,
-                                      columns=control_adata.var_names)
-            case_pd = pd.DataFrame(data=case_adata.X.A, index=case_adata.obs_names, columns=case_adata.var_names)
-        else:
-            control_pd = pd.DataFrame(data=control_adata.X, index=control_adata.obs_names,
-                                      columns=control_adata.var_names)
-            case_pd = pd.DataFrame(data=case_adata.X, index=case_adata.obs_names, columns=case_adata.var_names)
-        print("Successfully loaded the model")
-        return control_pd, case_pd
 
     def train(self, train_data, valid_data=None, niter=20000,
               model_path='./model', log_path='./logger',
@@ -114,16 +74,27 @@ class Model:
               lambda_adv=0.001, lambda_recon=1, lambda_encoding=0.1,
               betas=(0.5, 0.9), k=2, p=6):
 
-        A_pd, B_pd = train_data
-        A_tensor = Tensor(np.array(A_pd))
-        B_tensor = Tensor(np.array(B_pd))
+        # load data===============================
+        A_pd, A_celltype_ohe_pd, B_pd, B_celltype_ohe_pd = train_data
+        trainA = [np.array(A_pd), np.array(A_celltype_ohe_pd)]
+        trainB = [np.array(B_pd), np.array(B_celltype_ohe_pd)]
+
+        expr_trainA, cell_type_trainA = trainA
+        expr_trainB, cell_type_trainB = trainB
+        expr_trainA_tensor = Tensor(expr_trainA)
+        expr_trainB_tensor = Tensor(expr_trainB)
+        cell_type_trainA_tensor = Tensor(cell_type_trainA)
+        cell_type_trainB_tensor = Tensor(cell_type_trainB)
 
         if self.use_cuda and torch.cuda.is_available():
-            A_tensor = A_tensor.cuda()
-            B_tensor = B_tensor.cuda()
+            expr_trainA_tensor = expr_trainA_tensor.cuda()
+            expr_trainB_tensor = expr_trainB_tensor.cuda()
+            cell_type_trainA_tensor = cell_type_trainA_tensor.cuda()
+            cell_type_trainB_tensor = cell_type_trainB_tensor.cuda()
 
-        A_Dataset = torch.utils.data.TensorDataset(A_tensor)
-        B_Dataset = torch.utils.data.TensorDataset(B_tensor)
+        A_Dataset = torch.utils.data.TensorDataset(expr_trainA_tensor, cell_type_trainA_tensor)
+        B_Dataset = torch.utils.data.TensorDataset(expr_trainB_tensor, cell_type_trainB_tensor)
+
         A_train_loader = torch.utils.data.DataLoader(dataset=A_Dataset,
                                                      batch_size=batch_size,
                                                      shuffle=True,
@@ -134,17 +105,27 @@ class Model:
                                                      shuffle=True,
                                                      drop_last=True)
         if valid_data is not None:
-            A_pd_val, B_pd_val = valid_data
+            A_pd_val, A_celltype_ohe_pd_val, B_pd_val, B_celltype_ohe_pd_val = valid_data
 
-            A_tensor_val = Tensor(np.array(A_pd_val))
-            B_tensor_val = Tensor(np.array(B_pd_val))
+            valA = [np.array(A_pd_val), np.array(A_celltype_ohe_pd_val)]
+            valB = [np.array(B_pd_val), np.array(B_celltype_ohe_pd_val)]
+
+            expr_valA, cell_type_valA = valA
+            expr_valB, cell_type_valB = valB
+
+            expr_valA_tensor = Tensor(expr_valA)
+            expr_valB_tensor = Tensor(expr_valB)
+            cell_type_valA_tensor = Tensor(cell_type_valA)
+            cell_type_valB_tensor = Tensor(cell_type_valB)
 
             if self.use_cuda and torch.cuda.is_available():
-                A_tensor_val = A_tensor_val.cuda()
-                B_tensor_val = B_tensor_val.cuda()
+                expr_valA_tensor = expr_valA_tensor.cuda()
+                expr_valB_tensor = expr_valB_tensor.cuda()
+                cell_type_valA_tensor = cell_type_valA_tensor.cuda()
+                cell_type_valB_tensor = cell_type_valB_tensor.cuda()
 
-            A_Dataset_val = torch.utils.data.TensorDataset(A_tensor_val)
-            B_Dataset_val = torch.utils.data.TensorDataset(B_tensor_val)
+            A_Dataset_val = torch.utils.data.TensorDataset(expr_valA_tensor, cell_type_valA_tensor)
+            B_Dataset_val = torch.utils.data.TensorDataset(expr_valB_tensor, cell_type_valB_tensor)
 
             A_valid_loader = torch.utils.data.DataLoader(dataset=A_Dataset_val,
                                                          batch_size=batch_size,
@@ -159,12 +140,21 @@ class Model:
         # loss function
         recon_criterion = nn.MSELoss()
         encoding_criterion = nn.MSELoss()
+        dis_criterion = nn.BCELoss()
+        aux_criterion = nn.NLLLoss()
         # Optimizer
         optimizerD_A = torch.optim.Adam(self.D_A.parameters(), lr=lr_d, betas=betas)
         optimizerD_B = torch.optim.Adam(self.D_B.parameters(), lr=lr_d, betas=betas)
         optimizerG_A = torch.optim.Adam(self.G_A.parameters(), lr=lr_g, betas=betas)
         optimizerG_B = torch.optim.Adam(self.G_B.parameters(), lr=lr_g, betas=betas)
         optimizerE = torch.optim.Adam(self.E.parameters(), lr=lr_e)
+
+        ones = torch.ones(batch_size, 1)
+        zeros = torch.zeros(batch_size, 1)
+
+        if self.use_cuda and torch.cuda.is_available():
+            ones.cuda()
+            zeros.cuda()
 
         self.D_A.train()
         self.D_B.train()
@@ -193,70 +183,80 @@ class Model:
             # Train discriminator
             D_A_loss_item = 0.0
             D_B_loss_item = 0.0
-            for count in range(0, 5):
-                try:
-                    real_A = A_train_loader_it.next()[0]
-                    real_B = B_train_loader_it.next()[0]
-                except StopIteration:
-                    A_train_loader_it, B_train_loader_it = iter(A_train_loader), iter(B_train_loader)
-                    real_A = A_train_loader_it.next()[0]
-                    real_B = B_train_loader_it.next()[0]
 
-                if self.use_cuda and cuda_is_available():
-                    real_A = real_A.cuda()
-                    real_B = real_B.cuda()
-
-                self.D_A.zero_grad()
-                self.D_B.zero_grad()
-
-                out_A = self.D_A(real_A)
-                out_B = self.D_B(real_B)
-
-                real_A_z = self.E(real_A)
-                AB = self.G_B(real_A_z)
-
-                real_B_z = self.E(real_B)
-                BA = self.G_A(real_B_z)
-
-                out_BA = self.D_A(BA.detach())
-                out_AB = self.D_B(AB.detach())
-
-                D_A_gradient_penalty = calc_gradient_penalty(self.D_A, real_A.detach(), BA.detach(),
-                                                             batch_size=batch_size, use_cuda=self.use_cuda,
-                                                             k=k, p=p)
-                D_B_gradient_penalty = calc_gradient_penalty(self.D_B, real_B.detach(), AB.detach(),
-                                                             batch_size=batch_size, use_cuda=self.use_cuda,
-                                                             k=k, p=p)
-
-                D_A_real_loss = -torch.mean(out_A)
-                D_B_real_loss = -torch.mean(out_B)
-                D_A_fake_loss = torch.mean(out_BA)
-                D_B_fake_loss = torch.mean(out_AB)
-                D_A_loss = D_A_real_loss + D_A_fake_loss + D_A_gradient_penalty
-                D_B_loss = D_B_real_loss + D_B_fake_loss + D_B_gradient_penalty
-
-                D_A_loss.backward()
-                D_B_loss.backward()
-                optimizerD_A.step()
-                optimizerD_B.step()
-
-                D_A_loss_item += D_A_loss.item()
-                D_B_loss_item += D_B_loss.item()
-                writer.add_scalar('D_A_loss', D_A_loss, global_step=iteration)
-                writer.add_scalar('D_B_loss', D_B_loss, global_step=iteration)
-
-            # Train encoder and decoder
             try:
-                real_A = A_train_loader_it.next()[0]
-                real_B = B_train_loader_it.next()[0]
+                real_A, cell_type_A = A_train_loader_it.next()[0]
+                real_B, cell_type_B = B_train_loader_it.next()[0]
             except StopIteration:
                 A_train_loader_it, B_train_loader_it = iter(A_train_loader), iter(B_train_loader)
-                real_A = A_train_loader_it.next()[0]
-                real_B = B_train_loader_it.next()[0]
+                real_A, cell_type_A = A_train_loader_it.next()[0]
+                real_B, cell_type_B = B_train_loader_it.next()[0]
 
             if self.use_cuda and cuda_is_available():
                 real_A = real_A.cuda()
                 real_B = real_B.cuda()
+                cell_type_A = cell_type_A.cuda()
+                cell_type_B = cell_type_B.cuda()
+
+            self.D_A.zero_grad()
+            self.D_B.zero_grad()
+
+            out_A, out_A_cls = self.D_A(real_A, cell_type_A) # real A
+            out_B, out_B_cls = self.D_B(real_B, cell_type_B) # real B
+
+            real_A_z = self.E(real_A)
+            AB = self.G_B(real_A_z)
+
+            real_B_z = self.E(real_B)
+            BA = self.G_A(real_B_z)
+
+            out_BA, out_BA_cls = self.D_A(BA.detach(), cell_type_B) # false A
+            out_AB, out_AB_cls = self.D_B(AB.detach(), cell_type_A) # false B
+
+            _cell_type_A = torch.argmax(cell_type_A, dim=-1)
+            _cell_type_B = torch.argmax(cell_type_B, dim=-1)
+
+            dis_D_A_real = dis_criterion(out_A, ones)
+            aux_D_A_real = aux_criterion(out_A_cls, _cell_type_A)
+            D_A_real = dis_D_A_real + aux_D_A_real
+            dis_D_A_fake = dis_criterion(out_BA, zeros)
+            aux_D_A_fake = aux_criterion(out_BA_cls, _cell_type_B) 
+            D_A_fake = dis_D_A_fake + aux_D_A_fake
+
+            dis_D_B_real = dis_criterion(out_B, ones)
+            aux_D_B_real = aux_criterion(out_B_cls, _cell_type_B)
+            D_B_real = dis_D_B_real + aux_D_B_real
+            dis_D_B_fake = dis_criterion(out_AB, zeros) 
+            aux_D_B_fake = aux_criterion(out_AB_cls, _cell_type_A) 
+            D_B_fake = dis_D_B_fake + aux_D_B_fake
+
+            D_A_loss = D_A_real + D_A_fake
+            D_B_loss = D_B_real + D_B_fake
+
+            D_A_loss.backward()
+            D_B_loss.backward()
+            optimizerD_A.step()
+            optimizerD_B.step()
+
+            D_A_loss_item += D_A_loss.item()
+            D_B_loss_item += D_B_loss.item()
+            writer.add_scalar('D_A_loss', D_A_loss, global_step=iteration)
+            writer.add_scalar('D_B_loss', D_B_loss, global_step=iteration)
+
+            # Train encoder and decoder
+            try:
+                real_A, cell_type_A = A_train_loader_it.next()[0]
+                real_B, cell_type_B = B_train_loader_it.next()[0]
+            except StopIteration:
+                A_train_loader_it, B_train_loader_it = iter(A_train_loader), iter(B_train_loader)
+                real_A, cell_type_A = A_train_loader_it.next()[0]
+                real_B, cell_type_B = B_train_loader_it.next()[0]
+
+            if self.use_cuda and cuda_is_available():
+                real_A = real_A.cuda()
+                real_B = real_B.cuda()
+                cell_type_A = cell_type_A.cuda()
+                cell_type_B = cell_type_B.cuda()
 
             self.G_A.zero_grad()
             self.G_B.zero_grad()
@@ -277,21 +277,22 @@ class Model:
             BB_z = self.E(BB)
             BAB = self.G_B(BA_z)
 
-            out_AA = self.D_A(AA)
-            out_AB = self.D_B(AB)
-            out_BA = self.D_A(BA)
-            out_BB = self.D_B(BB)
-            out_ABA = self.D_A(ABA)
-            out_BAB = self.D_B(BAB)
+            out_AA, out_AA_cls = self.D_A(AA, cell_type_A)
+            out_AB, out_AB_cls = self.D_B(AB, cell_type_A)
+            out_BA, out_BA_cls = self.D_A(BA, cell_type_B)
+            out_BB, out_BB_cls = self.D_B(BB, cell_type_B)
+            out_ABA, out_ABA_cls = self.D_A(ABA, cell_type_A)
+            out_BAB, out_BAB_cls = self.D_B(BAB, cell_type_B)
 
             # adversarial loss
-            G_AA_adv_loss = -torch.mean(out_AA)
-            G_BA_adv_loss = -torch.mean(out_BA)
-            G_ABA_adv_loss = -torch.mean(out_ABA)
-
-            G_BB_adv_loss = -torch.mean(out_BB)
-            G_AB_adv_loss = -torch.mean(out_AB)
-            G_BAB_adv_loss = -torch.mean(out_BAB)
+            G_AA_adv_loss = dis_criterion(out_AA, ones) + aux_criterion(out_AA_cls, _cell_type_A)
+            G_BA_adv_loss = dis_criterion(out_BA, ones) + aux_criterion(out_BA_cls, _cell_type_B)
+            G_ABA_adv_loss = dis_criterion(out_ABA, ones) + aux_criterion(out_ABA_cls, _cell_type_A)
+        
+            G_BB_adv_loss = dis_criterion(out_BB, ones) + aux_criterion(out_BB_cls, _cell_type_B)
+            G_AB_adv_loss = dis_criterion(out_AB, ones) + aux_criterion(out_AB_cls, _cell_type_A)
+            G_BAB_adv_loss = dis_criterion(out_BAB, ones) + aux_criterion(out_BAB_cls, _cell_type_B)
+        
 
             G_A_adv_loss = G_AA_adv_loss + G_BA_adv_loss + G_ABA_adv_loss
             G_B_adv_loss = G_BB_adv_loss + G_AB_adv_loss + G_BAB_adv_loss
@@ -349,12 +350,12 @@ class Model:
                     with torch.no_grad():
                         for iteration_val in range(1, max_length):
                             try:
-                                cellA_val = A_valid_loader_it.next()[0]
-                                cellB_val = B_valid_loader_it.next()[0]
+                                cellA_val, cell_type_A_val = A_valid_loader_it.next()[0]
+                                cellB_val, cell_type_B_val = B_valid_loader_it.next()[0]
                             except StopIteration:
                                 A_valid_loader_it, B_valid_loader_it = iter(A_valid_loader), iter(B_valid_loader)
-                                cellA_val = A_valid_loader_it.next()[0]
-                                cellB_val = B_valid_loader_it.next()[0]
+                                cellA_val, cell_type_A_val = A_valid_loader_it.next()[0]
+                                cellB_val, cell_type_B_val = B_valid_loader_it.next()[0]
 
                             counter += 1
 
@@ -371,31 +372,33 @@ class Model:
                             ABA = self.G_A(AB_z)
                             BAB = self.G_B(BA_z)
 
-                            outA_val = self.D_A(cellA_val)
-                            outB_val = self.D_B(cellB_val)
-                            out_AA = self.D_A(AA)
-                            out_BB = self.D_B(BB)
-                            out_AB = self.D_B(AB)
-                            out_BA = self.D_A(BA)
-                            out_ABA = self.D_A(ABA)
-                            out_BAB = self.D_B(BAB)
+                            outA_val, out_A_cls = self.D_A(cellA_val, cell_type_A_val)
+                            outB_val, out_B_cls = self.D_B(cellB_val, cell_type_B_val)
+                            out_AA, out_AA_cls = self.D_A(AA, cell_type_A_val)
+                            out_BB, out_BB_cls = self.D_B(BB, cell_type_B_val)
+                            out_AB, out_AB_cls = self.D_B(AB, cell_type_A_val)
+                            out_BA, out_BA_cls = self.D_A(BA, cell_type_B_val)
+                            out_ABA, out_ABA_cls = self.D_A(ABA, cell_type_A_val)
+                            out_BAB, out_BAB_cls = self.D_B(BAB, cell_type_B_val)
 
-                            D_A_real_loss_val = -torch.mean(outA_val)
-                            D_B_real_loss_val = -torch.mean(outB_val)
-                            D_A_fake_loss_val = torch.mean(out_BA)
-                            D_B_fake_loss_val = torch.mean(out_AB)
+                            _cell_type_A = torch.argmax(cell_type_A_val, dim=-1)
+                            _cell_type_B = torch.argmax(cell_type_B_val, dim=-1)
+                            
+                            D_A_real_loss_val = dis_criterion(outA_val, ones) + aux_criterion(out_A_cls, _cell_type_A)
+                            D_B_real_loss_val = dis_criterion(outB_val, ones) + aux_criterion(out_B_cls, _cell_type_B)
+                            D_A_fake_loss_val = dis_criterion(out_BA, zeros) + aux_criterion(out_BA_cls, _cell_type_B) 
+                            D_B_fake_loss_val = dis_criterion(out_AB, zeros) + aux_criterion(out_AB_cls, _cell_type_A) 
 
                             D_A_loss_val += (D_A_real_loss_val + D_A_fake_loss_val).item()
                             D_B_loss_val += (D_B_real_loss_val + D_B_fake_loss_val).item()
 
-
-                            G_AA_adv_loss_val = -torch.mean(out_AA)
-                            G_BA_adv_loss_val = -torch.mean(out_BA)
-                            G_ABA_adv_loss_val = -torch.mean(out_ABA)
-
-                            G_BB_adv_loss_val = -torch.mean(out_BB)
-                            G_AB_adv_loss_val = -torch.mean(out_AB)
-                            G_BAB_adv_loss_val = -torch.mean(out_BAB)
+                            G_AA_adv_loss_val = dis_criterion(out_AA, ones) + aux_criterion(out_AA_cls, _cell_type_A)
+                            G_BA_adv_loss_val  = dis_criterion(out_BA, ones) + aux_criterion(out_BA_cls, _cell_type_B)
+                            G_ABA_adv_loss_val  = dis_criterion(out_ABA, ones) + aux_criterion(out_ABA_cls, _cell_type_A)
+                        
+                            G_BB_adv_loss_val  = dis_criterion(out_BB, ones) + aux_criterion(out_BB_cls, _cell_type_B)
+                            G_AB_adv_loss_val  = dis_criterion(out_AB, ones) + aux_criterion(out_AB_cls, _cell_type_A)
+                            G_BAB_adv_loss_val = dis_criterion(out_BAB, ones) + aux_criterion(out_BAB_cls, _cell_type_B)
 
                             G_A_adv_loss_val = G_AA_adv_loss_val + G_BA_adv_loss_val + G_ABA_adv_loss_val
                             G_B_adv_loss_val = G_BB_adv_loss_val + G_AB_adv_loss_val + G_BAB_adv_loss_val
